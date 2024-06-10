@@ -1,15 +1,24 @@
 import streamlit as st
+import sqlite3
 from main import run_license_plate_recognition
 import os
 import cv2
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import re
 
-# Constants
-pattern = r'\b(?:[A-Z]{1}[A-Z]{2}\d{2,3}[A-Z]{1,2}\d{4}|[A-Z]{2}\d{2,3}[A-Z]{1,2}\d{4})\b'
-frame_interval = 0.5
+# Database setup
+conn = sqlite3.connect('license_plates.db')
+c = conn.cursor()
+c.execute('''
+    CREATE TABLE IF NOT EXISTS plates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plate_number TEXT UNIQUE,
+        full_name TEXT,
+        address TEXT
+    )
+''')
+conn.commit()
 
 # Page configuration
 st.set_page_config(
@@ -26,90 +35,80 @@ st.write("**Имя преподавателя:** Бирюков Михаил А�
 st.write("**Группа:** ИКПИ-06")
 st.write("**ФИО:** Артамонов Егор Андреевич")
 
+# Initialize session state for form inputs
+if 'plate_number' not in st.session_state:
+    st.session_state['plate_number'] = ''
+if 'full_name' not in st.session_state:
+    st.session_state['full_name'] = ''
+if 'address' not in st.session_state:
+    st.session_state['address'] = ''
+if 'save_success' not in st.session_state:
+    st.session_state['save_success'] = False
+
 # Main application
 def app():
     st.header("Система распознавания государственных регистрационных знаков")
     st.subheader("Powered by YOLOv5")
     st.write("Добро пожаловать!")
 
-    with st.form("my_uploader"):
-        uploaded_file = st.file_uploader(
-            "Upload file", type=["png", "jpg", "jpeg", "mp4"], accept_multiple_files=False
-        )
-        submit = st.form_submit_button(label="Выгрузить")
+    uploaded_file = st.file_uploader("Загрузить файл", type=["png", "jpg", "jpeg", "mp4"], accept_multiple_files=False)
+    if uploaded_file is not None:
+        # Create directory if it doesn't exist
+        if not os.path.exists("temp"):
+            os.makedirs("temp")
 
-        if uploaded_file is not None:
-            # Create directory if it doesn't exist
-            if not os.path.exists("temp"):
-                os.makedirs("temp")
+        # Save uploaded file
+        save_path = os.path.join("temp", uploaded_file.name)
+        with open(save_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
 
-            # Save uploaded file
-            save_path = os.path.join("temp", uploaded_file.name)
-            with open(save_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+        # Process image here (e.g., display or analyze image)
+        st.image(save_path)
+        if st.button("Обработать файл"):
+            # Add spinner
+            with st.spinner(text="Обнаружение гос номера ..."):
+                recognizer = run_license_plate_recognition(save_path)
+                text = recognizer.recognize_text()
+                st.write(f"Распознанный текст: {text}")  # Debug output
+                if text:
+                    trimmed_string = text.strip()
+                    st.session_state['plate_number'] = trimmed_string
+                    st.write(f"Обнаруженный гос. номер: {trimmed_string}")
 
-            # Check if the uploaded file is a video
-            if uploaded_file.type.startswith('video'):
-                # Process video here (e.g., display or analyze frames)
-                st.video(uploaded_file)
+                    # Check database for existing plate number
+                    c.execute("SELECT full_name, address FROM plates WHERE plate_number=?", (trimmed_string,))
+                    result = c.fetchone()
+                    if result:
+                        st.write(f"Информация о владельце: ФИО - {result[0]}, Адрес - {result[1]}")
+                    else:
+                        st.write("Информация о номере не найдена. Пожалуйста, введите данные ниже:")
 
-                if submit and uploaded_file is not None:
-                    # Add spinner
-                    with st.spinner(text="Обнаружение осударственных регистрационных знаков ..."):
-                        if not os.path.exists("frame_dir"):
-                            os.makedirs("frame_dir")
+    if st.session_state['plate_number']:
+        with st.form(key='new_data_form'):
+            st.write(f"Гос. номер: {st.session_state['plate_number']}")
+            full_name = st.text_input("ФИО", value=st.session_state['full_name'])
+            address = st.text_input("Адрес", value=st.session_state['address'])
+            submit_new_data = st.form_submit_button(label='Сохранить')
+            if submit_new_data:
+                if full_name and address:
+                    try:
+                        c.execute("INSERT INTO plates (plate_number, full_name, address) VALUES (?, ?, ?)",
+                                  (st.session_state['plate_number'], full_name, address))
+                        conn.commit()
+                        st.success("Информация сохранена")
+                        # Reset session state
+                        st.session_state['plate_number'] = ''
+                        st.session_state['full_name'] = ''
+                        st.session_state['address'] = ''
+                        st.session_state['save_success'] = True
+                    except sqlite3.Error as e:
+                        st.error(f"Ошибка при сохранении данных: {e}")
+                else:
+                    st.error("Пожалуйста, введите все данные.")
 
-                        cap = cv2.VideoCapture(save_path)
-                        fps = cap.get(cv2.CAP_PROP_FPS)
-                        frame_interval_frames = int(fps * frame_interval)
-
-                        captured_plates = []
-                        captured_time = []
-                        frame_number = 0
-                        while True:
-                            ret, frame = cap.read()
-                            if not ret:
-                                break
-
-                            if frame_number % frame_interval_frames == 0:
-                                # Append the frame to the list
-                                frame_filename = os.path.join("frame_dir", f"frame_{frame_number + 1}.png")
-                                cv2.imwrite(frame_filename, frame)
-
-                                recognizer = run_license_plate_recognition(frame_filename)
-                                text = recognizer.recognize_text()
-                                if text:
-                                    matches = re.search(pattern, text)
-                                    if matches:
-                                        trimmed_string = matches.group(0)
-                                        trimmed_string = re.sub(r'^E(?=K)', '', trimmed_string)
-                                    else:
-                                        trimmed_string = None
-                                    if trimmed_string:
-                                        st.write(f"Обнаружен гос. номер {frame_number}: {trimmed_string}")
-                                        captured_plates.append(trimmed_string)
-                                        captured_time.append(frame_number)
-
-                            frame_number += 1
-
-                        # Release the video capture object and delete the temporary directory
-                        cap.release()
-                        st.warning("Frames extraction complete.")
-                        df = pd.DataFrame({'Обнаруженный гос номер:': captured_plates, 'Time Stamps': captured_time})
-                        df['Serial Number'] = range(1, len(df) + 1)
-
-                        st.write(df)
-
-            else:
-                # Process image here (e.g., display or analyze image)
-                st.image(save_path)
-                if submit and uploaded_file is not None:
-                    # Add spinner
-                    with st.spinner(text="Обнаружение гос номера ..."):
-                        recognizer = run_license_plate_recognition(save_path)
-                        text = recognizer.recognize_text()
-                        if text:
-                            st.write(f"Обнаруженный гос. номер: {text}")
+    if st.session_state['save_success']:
+        st.success("Информация успешно записана в базу данных.")
+        st.session_state['save_success'] = False
 
 if __name__ == "__main__":
     app()
